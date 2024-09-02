@@ -1,0 +1,265 @@
+from machine import UART
+import pyb
+from pyb import LED #导入LED
+import sensor, image, time, os, tf, math, gc
+from ulab import numpy as np
+import json
+
+uart = UART(1, 115200)  # 初始化串口 波特率设置为115200 TX是B12 RX是B13
+
+degree_str = ''
+x_str = ''
+y_str = ''
+
+# 初始化相机传感器
+sensor.reset()
+sensor.set_pixformat(sensor.RGB565)
+sensor.set_framesize(sensor.QQVGA)
+sensor.skip_frames(time=2000)
+
+clock = time.clock()
+
+if sensor.get_id() == sensor.OV7725:
+    sensor.__write_reg(0xAC, 0xDF)
+    sensor.__write_reg(0x8F, 0xFF)
+
+sensor.skip_frames(time=2000)
+clock = time.clock()
+
+
+
+net_path = "model_254-0.97.tflite"  # 定义模型的路径
+labels = [line.rstrip() for line in open("/sd/labels.txt")]  # 加载标签
+net = tf.load(net_path, load_to_fb=True)
+
+judge_str = '0'
+judge_str_read = '0'
+judge_str_cnt = 0
+
+degree_results = []
+Dx_results = []
+Dy_results = []
+
+
+#以下为需要根据实际场地调整的变量代码：
+rate1 = 12/90 #90度固定后修改，比例为卡片实际长度（cm）/卡片像素长度
+blue_threshold = (0, 50, -128, 127, -128, -30)
+erode = 2 #膨胀系数
+dilate = 5 #腐蚀系数
+
+
+#########################以上是各种定义变量/导入库################
+#################################小工具#######################
+def most_common_or_average(results):
+    int_results = [int(round(res)) for res in results]
+    freq = {}
+    for res in int_results:
+        if res in freq:
+            freq[res] += 1
+        else:
+            freq[res] = 1
+    most_common = max(freq, key=freq.get)
+    if freq[most_common] > 1:
+        return most_common
+    return sum(int_results) // len(int_results)
+
+def judge_type(img):
+    pixel_value = img.get_pixel(0, 0)
+    if isinstance(pixel_value, int):
+        print("灰度图像")
+    elif isinstance(pixel_value, tuple) and len(pixel_value) == 3:
+        print("RGB图像")
+    else:
+        print("未知类型")
+
+
+##################################画线部分######################
+
+
+
+def find_transitions(img):
+    height = img.height()
+    width = img.width()
+    transitions = []
+    goals = []
+
+    for y in range(0, height, 5):  # 垂直方向上每隔5个像素点遍历一次
+        previous_pixel = img.get_pixel(0, y)
+        for x in range(1, width):
+            current_pixel = img.get_pixel(x, y)
+            if previous_pixel == 0 and current_pixel == 255:  # 从黑色到白色
+                transitions.append((x, y))
+            elif previous_pixel == 255 and current_pixel == 0:  # 从白色到黑色
+                transitions.append((x, y))
+            previous_pixel = current_pixel
+
+    # 检查每个过渡点
+    for i in range(len(transitions)):
+        current_x = transitions[i][0]
+
+        # 向后比较
+        forward_greater_than_60 = True
+        for j in range(1, 6):
+            if i + j < len(transitions):
+                if abs(transitions[i + j][0] - current_x) <= 60:
+                    forward_greater_than_60 = False
+                    break
+
+        # 向前比较
+        backward_greater_than_60 = True
+        for j in range(1, 6):
+            if i - j >= 0:
+                if abs(transitions[i - j][0] - current_x) <= 60:
+                    backward_greater_than_60 = False
+                    break
+
+        if forward_greater_than_60 or backward_greater_than_60:
+            goals.append(transitions[i])
+
+    return transitions, goals
+
+def calculate_angle(p1, p2):
+    dx = p2[0] - p1[0]
+    dy = p2[1] - p1[1]
+    angle = math.degrees(math.atan2(dy, dx))
+    return angle
+
+def draw_transitions(img, transitions):
+    for (x, y) in transitions:
+        current_pixel = img.get_pixel(x, y)
+        if current_pixel == 255:
+            img.draw_cross(x, y, color=(0, 0, 255))  # 红色十字标记表示从黑色到白色的分界点
+        else:
+            img.draw_cross(x, y, color=(0, 255, 0))  # 绿色十字标记表示从白色到黑色的分界点
+
+def draw_lines(img, goals):
+    if len(goals) > 1:
+        # 按照 y 坐标排序，如果 y 坐标相同则按 x 坐标排序
+        goals.sort(key=lambda point: (point[1], point[0]))
+        for i in range(len(goals) - 1):
+            angle = calculate_angle(goals[i], goals[i + 1])
+            if 45 <= angle <= 135:
+                img.draw_line(goals[i][0], goals[i][1], goals[i + 1][0], goals[i + 1][1], color=(0, 0, 0),thickness = 5)
+def draw_goals(img,goals):
+    for(x,y)in goals:
+        img.draw_cross(x, y, color=(255, 0, 0))
+
+################################画矩形，测角度#################
+
+def find_rectangle_degree(img):
+    centers = []
+    for r in img.find_rects(threshold=100000):
+        area = r.w() * r.h()
+        if r.h() != 0:
+            rare = r.w() / r.h()
+            if rare > 1:
+                rare = 1 / rare
+        if area < 40000:
+            if rare > 0.7:
+                img.draw_rectangle(r.rect(), color=(255, 0, 0), thickness=2)
+                x = r.x() + r.w() / 2
+                y = r.y() + r.h() / 2
+                int_x = int(x)
+                int_y = int(y)
+                d_x = 80 - int_x
+                d_y = 60 - int_y
+                D_x = d_x * rate1
+                D_y = d_y * rate1
+                for p in r.corners():
+                    centers.append((p[0], p[1]))
+                centers = sorted(centers, key=lambda x: x[1])
+                point1 = centers[0]
+                point2 = centers[1] if centers[1][0] > centers[2][0] else centers[2]
+                img.draw_circle(point1[0], point1[1], 5, color=(0, 255, 0), thickness=2)
+                img.draw_cross(point2[0], point2[1], 5, color=(0, 255, 0), thickness=2)
+                distance = math.sqrt((point1[0] - point2[0]) ** 2 + (point1[1] - point2[1]) ** 2)
+                a = point1[0] - r.x()
+                b = r.w() - a
+                c = min(max(b / distance, -1), 1)
+                degree_1 = math.asin(c)
+                degree = math.degrees(degree_1)
+                return degree, D_x, D_y
+    return None, None, None
+
+################以上为各种妙妙工具############
+
+while uart.any():
+    uart.read()
+
+while(True):
+    if uart.any() > 0:
+        judge_str_read = uart.read().decode().strip()
+        print(judge_str_read)
+        if judge_str_read in ['0', '1', '2', '3']:
+            judge_str = judge_str_read
+            print('芝士' + judge_str)
+            print('雪豹' + judge_str)
+
+
+
+    if judge_str == '1' or judge_str =='4':
+        img = sensor.snapshot()
+        img.binary([blue_threshold], invert=True)
+        img.erode(erode)  # 腐蚀
+        img.dilate(dilate) # 膨胀
+        img.to_grayscale(copy=False)
+        ##judge_type(img)
+
+        transitions,goals = find_transitions(img)
+        img.to_rgb565(copy = 0)
+
+        draw_goals(img,goals)
+        draw_lines(img, goals)
+
+
+
+        degree, D_x, D_y = find_rectangle_degree(img)
+        if degree is not None and D_x is not None and D_y is not None:
+            degree_results.append(degree)
+            Dx_results.append(D_x)
+            Dy_results.append(D_y)
+
+            if len(degree_results) == 3:
+                degree_to_send = most_common_or_average(degree_results)
+                Dx_to_send = most_common_or_average(Dx_results)
+                Dy_to_send = most_common_or_average(Dy_results)
+
+                degree_str = str(degree_to_send)
+                x_str = str(Dx_to_send)
+                y_str = str(Dy_to_send)
+
+
+
+                if uart.any() > 0:
+                    judge_str_read = uart.read().decode().strip()
+                if judge_str_read == '@':
+                    uart.write(x_str + ',' )
+                    uart.write(y_str + ']')
+                    judge_str_read = '0'
+                    judge_str ='5'
+                if (judge_str_read != '@') and (judge_str =='1'):
+                    uart.write('[' + degree_str + ',')
+                    judge_str ='4'
+                    #print(judge_str)  调试用语句
+
+                degree_results = []
+                Dx_results = []
+                Dy_results = []
+
+        else:
+            degree_results = []
+            Dx_results = []
+            Dy_results = []
+
+    elif judge_str == '2':
+        sensor.set_framesize(sensor.VGA)
+        img = sensor.snapshot().lens_corr(strength=1.5, zoom=1.0)
+        for obj in tf.classify(net, img, min_scale=1.0, scale_mul=0.5, x_overlap=0.0, y_overlap=0.0):
+            sorted_list = sorted(zip(labels, obj.output()), key=lambda x: x[1], reverse=True)
+            for i in range(1):
+                print("%s = %f" % (sorted_list[i][0], sorted_list[i][1]))
+                first_character = sorted_list[i][0].split('-')[0]
+                uart.write('{' + first_character + '}' + '\r\n')
+                white.on()
+                pyb.mdelay(500)
+                white.off()
