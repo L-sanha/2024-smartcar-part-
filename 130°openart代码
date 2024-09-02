@@ -1,0 +1,710 @@
+from machine import UART
+from pyb import LED
+import struct
+uart = UART(1, 115200)  # 初始化串口 波特率设置为115200 TX是B12 RX是B13
+import sensor, image, time, os, tf, math, gc
+from ulab import numpy as np
+import json
+
+DEBUG = 0
+# --------------------umatrix---------------------------#
+import sys
+
+stypes = [bool, int]
+ddtype = int
+estypes = []
+flt_eps = 1.19E-7
+
+
+class matrix(object):
+
+    def __init__(self, data, cstride=0, rstride=0, dtype=None):
+        ''' Builds a matrix representation of 'data'.
+            'data' can be a list (columns) of lists (rows)
+            [[1,2,3],[4,5,6]] or
+            a simple list organized as determined by rstride and cstride:
+            [1,2,3,4,5,6] cstride=1, rstride=3.
+            Elements will be of highest type included in 'data' or
+            'dtype' can be used to force the type.
+        '''
+        if cstride != 0:
+            if cstride == 1:
+                self.n = rstride
+                self.m = int(len(data) / self.n)
+            else:
+                self.m = cstride
+                self.n = int(len(data) / self.m)
+            self.cstride = cstride
+            self.rstride = rstride
+            self.data = data
+        else:
+            # else determine shape from list passed in
+            self.n = 1
+            if type(data) == int:
+                self.m = 1
+            else:  # it is a list
+                self.m = len(data)
+                # is data[0] a list
+                if (type(data[0]) == list):
+                    self.n = len(data[0])
+            self.data = [data[i][j]
+                         for i in range(self.m) for j in range(self.n)]
+            self.cstride = 1
+            self.rstride = self.n
+        # ensure all elements are of the same type
+        if dtype is None:
+            self.dtype = stypes[max([stypes.index(type(i)) for i in self.data])]
+        else:
+            if dtype in stypes:
+                self.dtype = dtype
+            else:
+                raise TypeError('unsupported type', dtype)
+        self.data = [self.dtype(i) for i in self.data]
+
+    def __len__(self):
+        return self.m
+
+    def __eq__(self, other):
+        if self.shape == other.shape:
+            res = all([self.data[i] == other.data[i] for i in range(self.size())])
+            return res and (self.shape == other.shape)
+        else:
+            raise ValueError('shapes not equal')
+
+    def __ne__(self, other):
+        return not __eq__(other)
+
+    def __iter__(self):
+        self.cur = 0
+        # determine proper axis
+        if self.m == 1:
+            self.cnt_lim = self.n
+        else:
+            self.cnt_lim = self.m
+        return self
+
+    def __next__(self):
+        '''
+        Returns a matrix if m > 1
+        else the next numeric element of the vector.
+        (Numpy returns vectors if selected via slice)
+        '''
+        if self.cur >= self.cnt_lim:
+            raise StopIteration
+        self.cur = self.cur + 1
+        if self.m == 1:
+            return self.data[self.cur - 1]
+        else:
+            return self[self.cur - 1]
+
+    def slice_to_offset(self, r0, r1, c0, c1):
+        # check values and limit them
+        nd = [self.data[i * self.rstride + j * self.cstride]
+              for i in range(r0, r1) for j in range(c0, c1)]
+        return matrix(nd, cstride=1, rstride=(c1 - c0))
+
+    def slice_indices(self, index, axis=0):
+        # handles the unsupported slice.indices() method in uPy.
+        # If implemented:
+        #     midx = index.indices(self.m)
+        # should work.
+        if isinstance(index.start, type(None)):
+            s0 = 0
+        else:
+            s0 = min(int(index.start), self.shape[axis])
+        if isinstance(index.stop, type(None)):
+            p0 = self.shape[axis]
+        else:
+            p0 = min(int(index.stop), self.shape[axis])
+        return (s0, p0)
+
+    def __getitem__(self, index):
+        if type(index) == tuple:
+            # int and int
+            # int and slice
+            # slice and int
+            # slice and slice
+            if isinstance(index[0], int):
+                s0 = index[0]
+                p0 = s0 + 1
+            else:  # row slice
+                s0, p0 = self.slice_indices(index[0], 0)
+            if isinstance(index[1], int):
+                s1 = index[1]
+                p1 = s1 + 1
+            else:  # column slice
+                s1, p1 = self.slice_indices(index[1], 1)
+        elif type(index) == list:
+            # list of indices etc
+            raise NotImplementedError('Fancy indexing')
+        else:
+            # type is int? This will default to returning a row
+            s0 = index
+            p0 = s0 + 1
+            s1 = 0
+            p1 = self.n
+        # resultant matrix
+        z = self.slice_to_offset(s0, p0, s1, p1)
+        # if it's a single entry then return that entry as int, float etc.
+        if (p0 == s0 + 1) and (p1 == s1 + 1):
+            return z.data[0]
+        else:
+            return z
+
+    def __setitem__(self, index, val):
+        if type(index) != tuple:
+            # need to make it a slice without the slice function
+            raise NotImplementedError('Need to use the slice [1,:] format.')
+        # int and int => single entry gets changed
+        # combinations of int and slice => row and columns take on elements from val
+        if isinstance(index[0], int):
+            s0 = index[0]
+            p0 = s0 + 1
+        else:  # slice
+            s0, p0 = self.slice_indices(index[0], 0)
+        if isinstance(index[1], int):
+            s1 = index[1]
+            p1 = s1 + 1
+        else:  # slice
+            s1, p1 = self.slice_indices(index[1], 1)
+        if type(val) == matrix:
+            val = val.data
+        elif type(val) not in [list, tuple]:
+            val = [val]
+        if not all([type(i) in stypes for i in val]):
+            raise ValueError('Non numeric entry')
+        else:
+            # assign list values wrapping as necessary to fill destination
+            k = 0
+            for i in range(s0, p0):
+                for j in range(s1, p1):
+                    self.data[i * self.rstride + j * self.cstride] = (self.dtype(val[k]))
+                    k = (k + 1) % len(val)
+
+    # there is also __delitem__
+
+    # def __str__(self):
+    def __repr__(self):
+        # things that use __str__ will fallback to __repr__
+        # find max string field size for formatting
+        l = 0
+        for i in self.data:
+            l = max(l, len(repr(i)))
+        s = 'mat(['
+        r = 0
+        for i in range(self.m):
+            c = 0
+            s = s + '['
+            for j in range(self.n):
+                s1 = repr(self.data[r + c])
+                s = s + s1 + ' ' * (l - len(s1))
+                if (j < (self.n - 1)):
+                    s = s + ', '
+                c = c + self.cstride
+            if (i < (self.m - 1)):
+                s = s + '],\n     '
+            else:
+                s = s + ']'
+            r = r + self.rstride
+        s = s + '])'
+        return s
+
+    # Reflected operations are not yet implemented in MicroPython
+    # __rmul__ for example will not be invoked
+
+    def __neg__(self):
+        ndat = [self.data[i] * (-1) for i in range(len(self.data))]
+        return matrix(ndat, cstride=self.cstride, rstride=self.rstride)
+
+    def __do_op__(self, a, b, op):
+        if op == '+':
+            return (a + b)
+        elif op == '-':
+            return (a - b)
+        elif op == '*':
+            return (a * b)
+        elif op == '**':
+            return (a ** b)
+        elif op == '/':
+            try:
+                return (a / b)
+            except ZeroDivisionError:
+                raise ZeroDivisionError('division by zero')
+        elif op == '//':
+            try:
+                return (a // b)
+            except ZeroDivisionError:
+                raise ZeroDivisionError('division by zero')
+        else:
+            raise NotImplementedError('Unknown operator ', op)
+
+    def __OP__(self, a, op):
+        if type(a) in stypes:
+            # matrix - scaler elementwise operation
+            ndat = [self.__do_op__(self.data[i], a, op) for i in range(len(self.data))]
+            return matrix(ndat, cstride=self.cstride, rstride=self.rstride)
+        elif (type(a) == list):
+            # matrix - list elementwise operation
+            # hack - convert list to matrix and resubmit then it gets handled below
+            # if self.n = 1 try transpose otherwise broadcast error to match numpy
+            if (self.n == 1) and (len(a) == self.m):
+                return self.__OP__(matrix([a]).T, op)
+            elif len(a) == self.n:
+                return self.__OP__(matrix([a]), op)
+            else:
+                raise ValueError('could not be broadcast')
+        elif (type(a) == matrix):
+            if (self.m == a.m) and (self.n == a.n):
+                # matrix - matrix elementwise operation
+                # use matrix indices to handle views
+                ndat = [self.__do_op__(self[i, j], a[i, j], op) for i in range(self.m) for j in range(self.n)]
+                return matrix(ndat, cstride=1, rstride=self.n)
+            # generalize the following two elif for > 2 dimensions?
+            elif (self.m == a.m):
+                # m==m n!=n => column-wise row operation
+                Y = self.copy()
+                for i in range(self.n):
+                    # this call _OP_ once for each row and __do_op__ for each element
+                    for j in range(self.m):
+                        Y[j, i] = self.__do_op__(Y[j, i], a[j, 0], op)
+                return Y
+            elif (self.n == a.n):
+                # m!=m n==n => row-wise col operation
+                Y = self.copy()
+                for i in range(self.m):
+                    # this call _OP_ once for each col and __do_op__ for each element
+                    for j in range(self.n):
+                        Y[i, j] = self.__do_op__(Y[i, j], a[0, j], op)
+                return Y
+            else:
+                raise ValueError('could not be broadcast')
+        raise NotImplementedError('__OP__ matrix + ', type(a))
+
+    def __add__(self, a):
+        ''' matrix - scaler elementwise addition'''
+        return self.__OP__(a, '+')
+
+    def __radd__(self, a):
+        ''' scaler - matrix elementwise addition'''
+        ''' commutative '''
+        return self.__add__(a)
+
+    def __sub__(self, a):
+        ''' matrix - scaler elementwise subtraction '''
+        if type(a) in estypes:
+            return self.__add__(-a)
+        raise NotImplementedError('__sub__ matrix -', type(a))
+
+    def __rsub__(self, a):
+        ''' scaler - matrix elementwise subtraction '''
+        self = -self
+        return self.__add__(a)
+
+    def __mul__(self, a):
+        ''' matrix scaler elementwise multiplication '''
+        return self.__OP__(a, '*')
+
+    def __rmul__(self, a):
+        ''' scaler * matrix elementwise multiplication
+            commutative
+        '''
+        return self.__mul__(a)
+
+    def __truediv__(self, a):
+        ''' matrix / scaler elementwise division '''
+        return self.__OP__(a, '/')
+
+    def __rtruediv__(self, a):
+        ''' scaler / matrix elementwise division '''
+        return self.__OP__(a, '/')
+
+    def __floordiv__(self, a):
+        ''' matrix // scaler elementwise integer division '''
+        return self.__OP__(a, '//')
+
+    def __rfloordiv__(self, a):
+        ''' scaler // matrix elementwise integer division '''
+        return self.__OP__(a, '//')
+
+    def __pow__(self, a):
+        ''' matrix ** scaler elementwise power '''
+        return self.__OP__(a, '**')
+
+    def __rpow__(self, a):
+        ''' scaler ** matrix elementwise power '''
+        return self.__OP__(a, '**')
+
+    def copy(self):
+        """ Return a copy of matrix, not just a view """
+        return matrix([i for i in self.data],
+                      cstride=self.cstride, rstride=self.rstride)
+
+    def size(self, axis=0):
+        """ 0 entries
+            1 rows
+            2 columns
+        """
+        return [self.m * self.n, self.m, self.n][axis]
+
+    @property
+    def shape(self):
+        return (self.m, self.n)
+
+    @shape.setter
+    def shape(self, nshape):
+        """ check for proper length """
+        if (nshape[0] * nshape[1]) == self.size():
+            self.m, self.n = nshape
+            self.cstride = 1
+            self.rstride = self.n
+        else:
+            raise ValueError('total size of new matrix must be unchanged')
+        return self
+
+    @property
+    def is_square(self):
+        return self.m == self.n
+
+    def reshape(self, nshape):
+        """ check for proper length """
+        X = self.copy()
+        X.shape = nshape
+        return X
+
+    def transpose(self):
+        """ Return a view """
+        X = matrix(self.data, cstride=self.rstride, rstride=self.cstride)
+        if self.cstride == self.rstride:
+            # handle column vector
+            X.shape = (self.n, self.m)
+        return X
+
+    def reciprocal(self, n=1):
+        return matrix([n / i for i in self.data], cstride=self.cstride, rstride=self.rstride)
+
+    def apply(self, func, *args, **kwargs):
+        """ call a scalar function on each element, returns a new matrix
+        passes *args and **kwargs to func unmodified
+        note: this is not useful for matrix-matrix operations
+        e.g.
+            y = x.apply(math.sin)
+            y = x.apply(lambda a,b: a>b, 5) # equivalent to y = x > 5
+            y = x.apply(operators.gt, 5)    # equivalent to y = x > 5 (not in micropython)
+        """
+        return matrix([func(i, *args, **kwargs) for i in self.data],
+                      cstride=self.cstride, rstride=self.rstride)
+
+
+def fp_eps():
+    ''' Determine floating point resolution '''
+    e = 1
+    while 1 + e > 1:
+        e = e / 2
+    return 2 * e
+
+
+flt_eps = fp_eps()
+try:
+    if sys.implementation.name == 'micropython' and sys.platform == 'linux':
+        # force this as there seems to be some interaction with
+        # some operations done using the C library with a smaller epsilon (doubles)
+        flt_eps = 1.19E-7  # single precision IEEE 2**-23  double 2.22E-16 == 2**-52
+except:
+    pass
+# Determine supported types
+try:
+    stypes.append(float)
+    ddtype = float
+except:
+    pass
+try:
+    stypes.append(complex)
+except:
+    pass
+# extended types
+estypes = [matrix]
+estypes.extend(stypes)
+
+
+# -----------------------------------------------#
+# ------------------------ulinalg-----------------------#
+
+def zeros(m, n, dtype=ddtype):
+    return matrix([[0 for i in range(n)] for j in range(m)], dtype=dtype)
+
+
+def ones(m, n, dtype=ddtype):
+    return zeros(m, n, dtype) + 1
+
+
+def eye(m, dtype=ddtype):
+    Z = zeros(m, m, dtype=dtype)
+    for i in range(m):
+        Z[i, i] = 1
+    return Z
+
+
+def inverse_matrix(m):
+    # 获取矩阵的大小
+    n = len(m)
+    # 构造增广矩阵
+    aug = zeros(n, 2 * n, dtype=float)
+    for i in range(n):
+        for j in range(n):
+            aug[i, j] = m[i, j]
+        aug[i, i + n] = 1
+    # 对增广矩阵进行高斯消元法
+    for i in range(n):
+        # 如果主对角线上的元素为0，则交换该列的不为0的行到主对角线上
+        if aug[i, i] == 0:
+            for j in range(i + 1, n):
+                if aug[j, i] != 0:
+                    # 交换两行
+                    tep = aug[i, :]
+                    aug[i, :] = aug[j, :]
+                    aug[j, :] = tep
+                    break
+            else:
+                return None  # 如果没有找到不为0的元素，则说明没有逆矩阵
+        # 将该行除以主元，使主对角线上的元素为1
+        aug[i, :] = aug[i, :] / aug[i, i]
+        # 将其他行加上该行乘以相应的系数，使其他列在该行的位置为0
+        for j in range(n):
+            if j != i:
+                aug[j, :] = aug[j, :] - aug[j, i] * aug[i, :]
+    # 返回右半部分作为逆矩阵
+    return aug[:, n:2 * n]
+
+
+def dot(X, Y):
+    ''' Dot product '''
+    if X.size(2) == Y.size(1):
+        Z = []
+        for k in range(X.size(1)):
+            for j in range(Y.size(2)):
+                Z.append(sum([X[k, i] * Y[i, j] for i in range(Y.size(1))]))
+        return matrix(Z, cstride=1, rstride=Y.size(2))
+    else:
+        raise ValueError('shapes not aligned')
+
+
+def getPerspectMat(ls, tar_ls):
+    pre_trans = []
+    aft_trans = []
+    H = []
+    for i in range(4):
+        pre_trans.append([ls[i, 0], ls[i, 1], 1, 0, 0, 0, -tar_ls[i, 0] * ls[i, 0], -tar_ls[i, 0] * ls[i, 1],
+                          0, 0, 0, ls[i, 0], ls[i, 1], 1, -tar_ls[i, 1] * ls[i, 0], -tar_ls[i, 1] * ls[i, 1]])
+        aft_trans.append([tar_ls[i, 0],
+                          tar_ls[i, 1]])
+    pre_trans = matrix(pre_trans).reshape([8, 8])
+    # print("pre_trans:\n", pre_trans)
+    # check if the pre_trans inversible
+
+    y = inverse_matrix(pre_trans * 10) * 10
+    # print("y:\n", y)  #  debug print
+    aft_trans = matrix(aft_trans).reshape([8, 1])
+    tep = dot(y, aft_trans)
+    for i in range(8):
+        H.append([tep[i]])
+    H.append([1])
+    H = matrix(H, dtype=float).reshape([3, 3])
+    return H
+
+
+
+##################7.13尝试#########
+
+
+def lstsq(A, b):
+    # 求解最小二乘解，Ax=b
+    # 使用矩阵分解方法：QR分解，将A分解为Q*R，x=R^-1*Q^T*b
+    Q, R = np.linalg.qr(A)
+    x = np.linalg.inv(R) @ Q.T @ b
+    return x
+
+    
+def perspective_transform(src_points, dst_points):
+    # 构造线性方程组 A * M = B
+    A = []
+    B = []
+    
+    for i in range(4):
+        x, y = src_points[i][0], src_points[i][1]
+        u, v = dst_points[i][0], dst_points[i][1]
+        A.append([x, y, 1, 0, 0, 0, -u*x, -u*y])
+        A.append([0, 0, 0, x, y, 1, -v*x, -v*y])
+        B.append(u)
+        B.append(v)
+    
+    A = np.array(A)
+    B = np.array(B)
+    
+    # 使用最小二乘法求解线性方程组 A * M = B
+    M, _, _, _ = lstsq(A, B, rcond=None)
+    
+    # 将M变为3x3的透视变换矩阵
+    M = np.append(M, 1)
+    M = np.reshape(M, (3, 3))
+    
+    return M
+
+
+
+######################
+
+def Send_loc(uart,point_ls:matrix):
+    for i in range(2 * point_ls.n):
+        Send_float(uart, point_ls[i % 2, i // 2])
+        time.sleep_ms(5)
+    Send_float(uart,100.0)
+    return 0
+def Send_float(uart,bytes):
+    uart.write(struct.pack("<f",bytes))
+
+def Get_array(x,y):
+    return np.array([x, y])
+######上面是写程序会用到的神秘妙妙工具########
+
+
+
+
+ls = np.array([[2, 106], [314, 93], [4, 235], [319, 216]])
+tar_ls = np.array([(41.6, 41.5), (-37.5, 41.5), (13, 8.1), (-10.3, 8.1)])
+
+
+
+#H = getPerspectMat(ls, tar_ls)
+#7.14尝试，如果不行，把上面那行解除注释：
+H=perspective_transform(ls,tar_ls)
+
+i = 0
+j = 0
+while i < 3:
+    j = 0
+    while j < 3:
+        if i == 0 and j == 0:
+            h1 = H[i, j]
+        elif i == 0 and j == 1:
+            h2 = H[i, j]
+        elif i == 0 and j == 2:
+            h3 = H[i, j]
+        elif i == 1 and j == 0:
+            h4 = H[i, j]
+        elif i == 1 and j == 1:
+            h5 = H[i, j]
+        elif i == 1 and j == 2:
+            h6 = H[i, j]
+        elif i == 2 and j == 0:
+            h7 = H[i, j]
+        elif i == 2 and j == 1:
+            h8 = H[i, j]
+        elif i == 2 and j == 2:
+            h9 = H[i, j]
+        j += 1
+    i += 1
+
+
+def getDistance(u, v):
+    # k=0
+    # while k<3:
+    # if k==0:
+    # u=U2[k]
+    # elif k==1:
+    #   v=U2[k]
+    # elif k==2:
+    #  z=U2[k]
+    #  k+=1
+
+    x = (h1 * u + h2 * v + h3) / (h7 * u + h8 * v + h9)
+    y = (h4 * u + h5 * v + h6) / (h7 * u + h8 * v + h9)
+    return x, y
+
+
+# 如果摄像头位置出现改变，那么这两个值需要对应重写
+# U2=np.array([96,157,1]) #像素坐标的值
+radius = 3
+r = 256
+g = 0
+b = 0
+
+sensor.reset()
+sensor.set_pixformat(sensor.RGB565)
+sensor.set_framesize(sensor.QVGA)
+sensor.skip_frames(time=2000)
+face_detect = '/sd/yolo3_iou_smartcar_final_with_post_processing.tflite'
+net = tf.load(face_detect)
+x=1
+y=2
+#point=Get_array(x,y)
+#output_str="[%d,%d]" % (x,y)
+targetpoints=[]
+targetpoints1=[]
+  # 初始化为正无穷大
+closest_targetpoint = None
+
+
+while uart.any():
+    uart.read()
+
+
+judge_str='0'
+
+while (True):
+    #print(judge_str)
+    if (uart.any() >0):
+        judge_str = uart.read().decode().strip()
+        print('芝士')
+        print(judge_str)
+        print('雪豹')
+
+    if judge_str == '1':
+        while uart.any():
+            uart.read()
+        #uart.write(output_str+'\r\n')
+        img = sensor.snapshot()
+        #Send_float(uart,200.0)
+        min_distance = float('inf')
+        for obj in tf.detect(net, img):
+            x1, y1, x2, y2, label, scores = obj
+
+            if (scores > 0.70):
+                # print(obj)
+                w = x2 - x1
+                h = y2 - y1
+                x1 = int((x1 - 0.1) * img.width())
+                y1 = int(y1 * img.height())
+                targetpoints1.append((x1,y1))
+                #print(targetpoints1)
+                w = int(w*img.width())
+                h = int(h*img.height())
+                img.draw_rectangle((x1, y1, w, h), thickness=2)
+                # print(x1, y1)
+                x, y = getDistance(x1, y1)
+                #point=Get_array(x,y)
+                targetpoints.append((x,y))
+
+                #print("x方向距离：", x)
+                #print("y方向距离：", y)
+
+        print(targetpoints)
+        if len(targetpoints)>0:
+            for targetpoint in targetpoints:
+                x, y = targetpoint
+                distance = math.sqrt(x ** 2 + y ** 2)
+                if distance < min_distance:
+                    min_distance = distance
+                    closest_targetpoint = targetpoint
+                closest_targetpoint_int = (int(closest_targetpoint[0]), int(closest_targetpoint[1]))
+                closest_point_str = "({}, {})".format(closest_targetpoint_int[0], closest_targetpoint_int[1])
+                uart.write(closest_point_str+'\r\n')
+    #targetpoints_str = ', '.join([f'({int(x)}, {int(y)})' for x, y in targetpoints])
+    #把整个targetpoints列表变为字符串
+        else :
+            uart.write('0'+'\r\n')
+
+
+
+    targetpoints.clear()
+    targetpoints1.clear()
+
